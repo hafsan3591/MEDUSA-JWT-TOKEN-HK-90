@@ -108,9 +108,8 @@ def build_login_request(open_id: str, access_token: str) -> bytes:
     message.open_id = open_id
     message.access_token = access_token
     
-    # গার্ডেনার নতুন সিকিউরিটি বাইপাস করার জন্য ডাইনামিক ডেটা
+    # ডাইনামিক ডেটা আপডেট (সঠিক ফিল্ড নেম দিয়ে)
     message.timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    message.release_channel = ""
     message.api = "Android OS 9 / API-28 (SP1A.210812.016/G998BXXU4BULF)"
     
     return message.SerializeToString()
@@ -232,7 +231,6 @@ async def send_major_login(open_id: str, access_token: str) -> dict[str, Any]:
         if nickname: result["name"] = nickname
         return result
     except InvalidMajorLoginResponse:
-        # সার্ভার কী ফেরত দিচ্ছে তার আসল কারণ এখানে দেখাবে
         snippet = content[:80].decode('utf-8', errors='ignore')
         raise InvalidMajorLoginResponse(f"Invalid Data: {snippet}")
 
@@ -307,7 +305,6 @@ def generate_jwt():
     except UpstreamTimeoutError:
         return jsonify({"success": False, "error": "সার্ভার টাইমআউট"}), 504
     except (UpstreamRequestError, InvalidMajorLoginResponse) as e:
-        # এখানে আসল এরর মেসেজটি দেখতে পাবেন
         return jsonify({"success": False, "error": f"সার্ভার রিজেক্ট করেছে: {str(e)}"}), 502
     except Exception as e:
         return jsonify({"success": False, "error": f"আননো এরর: {str(e)}"}), 502
