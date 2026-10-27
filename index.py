@@ -355,6 +355,209 @@ async def send_major_login(open_id: str, access_token: str) -> dict[str, Any]:
             exc.response.headers.get("content-type", "unknown"),
             len(exc.response.content),
         )
+        raise UpstreamRequestError(f"HTTP {exc.response.status_code} from MajorLogin") from exc
+    except httpx.RequestError as exc:
+        raise UpstreamRequestError(f"Request Error: {str(exc)}") from exc
+
+    content_type = response.headers.get("content-type", "unknown")
+    content = response.content
+    if not content:
+        app.logger.warning("MajorLogin upstream returned an empty response (content_type=%s)", content_type)
+        raise InvalidMajorLoginResponse("Empty response from server")
+        
+    # DEBUG LOG: সার্ভার থেকে ঠিক কী আসছে তা দেখা যাবে Vercel-এর Logs-এ
+    app.logger.info(f"DEBUG MajorLogin Response: {content[:500]}")
+
+    try:
+        result = _parse_major_login_response(content)
+        nickname = await _fetch_login_data_nickname(
+            encrypted_data,
+            result.get("location") if isinstance(result.get("location"), str) else None,
+            result.get("token") if isinstance(result.get("token"), str) else None,
+        )
+        if nickname:
+            result["name"] = nickname
+        return result
+    except InvalidMajorLoginResponse:
+        app.logger.warning(
+            "MajorLogin response was not valid protobuf (status=%s, content_type=%s, bytes=%d)",
+            response.status_code,
+            content_type,
+            len(content),
+        )
+        raise
+
+
+def _normalize_result(
+    result: dict[str, Any], access_token: str, uid: str | None = None
+) -> dict[str, Any]:
+    token = result.get("token")
+    account_id = result.get("account_id")
+    name = result.get("name")
+    if not isinstance(name, str) or not name.strip():
+        name = f"Player_{account_id}" if account_id else None
+    region = result.get("region", "N/A")
+    return {
+        "accountId": account_id,
+        "name": name,
+        "agoraEnvironment": result.get("agora_environment"),
+        "ipRegion": result.get("ip_region", region),
+        "lockRegion": result.get("lock_region", region),
+        "notiRegion": result.get("noti_region", region),
+        "serverUrl": result.get("location"),
+        "accessToken": access_token,
+        "token": token,
+        "region": region,
+        "status": result.get("status", "N/A"),
+        "uid": uid,
+    }
+
+
+async def generate_from_credentials(uid: str, password: str) -> dict[str, Any]:
+    access_token, open_id = await get_access_token(uid, password)
+    if not access_token or not open_id:
+        raise ValueError("Guest token response was incomplete")
+    return _normalize_result(await send_major_login(open_id, access_token), access_token, uid)
+
+
+async def generate_from_access_token(access_token: str) -> dict[str, Any]:
+    token_data = await inspect_access_token(access_token)
+    if not token_data:
+        raise ValueError("Access token is invalid")
+    result = await send_major_login(
+        token_data["open_id"], access_token
+    )
+    return _normalize_result(result, access_token, str(token_data.get("uid", "")))
+
+
+def _run(coroutine: Awaitable[T]) -> T:
+    return asyncio.run(coroutine)
+
+
+def _token_response(
+    access_token: str | None, uid: str | None, password: str | None
+) -> dict[str, Any]:
+    if access_token:
+        key = _cache_key("access", access_token)
+        cached = _cache_get(key)
+        if cached:
+            return cached
+        response = _run(generate_from_access_token(access_token))
+    elif uid and password:
+        key = _cache_key("credentials", uid, password)
+        cached = _cache_get(key)
+        if cached:
+            return cached
+        response = _run(generate_from_credentials(uid, password))
+    else:
+        raise ValueError("Missing uid/password or access_token")
+
+    if response.get("token"):
+        _cache_set(key, response)
+    return response
+
+
+# === Flask app and routes ===
+def _request_json_object() -> dict[str, Any]:
+    payload = request.get_json(silent=True)
+    return payload if isinstance(payload, dict) else {}
+
+
+# template_folder = "." মানে একই ফোল্ডারে index.html খুঁজবে
+app = Flask(__name__, template_folder=BASE_DIR)
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/api/generate", methods=["POST"])
+def generate_jwt():
+    """ফ্রন্টএন্ড থেকে UID এবং পাসওয়ার্ড নিয়ে JWT তৈরি করে"""
+    payload = _request_json_object()
+    uid = payload.get("uid")
+    password = payload.get("password")
+
+    if not uid or not password:
+        return jsonify({"success": False, "error": "UID এবং পাসওয়ার্ড উভয়ই প্রয়োজন"}), 400
+
+    try:
+        response = _token_response(None, uid, password)
+        if not response.get("token"):
+            return jsonify({"success": False, "error": "JWT টোকেন তৈরি করা যায়নি (unregistered or banned account)"}), 502
+        return jsonify({"success": True, "token": response["token"]})
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    except UpstreamTimeoutError:
+        app.logger.warning("OB55 JWT generation timed out")
+        return jsonify({"success": False, "error": "আপস্ট্রিম সার্ভিস টাইমআউট হয়েছে"}), 504
+    except (UpstreamRequestError, InvalidMajorLoginResponse) as e:
+        # এখানে আসল এরর মেসেজটি দেখানো হচ্ছে
+        app.logger.warning(f"OB55 JWT generation error: {str(e)}")
+        return jsonify({"success": False, "error": f"সার্ভার এরর: {str(e)[:60]}"}), 502
+    except Exception as e:
+        app.logger.exception("OB55 JWT generation failed")
+        return jsonify({"success": False, "error": f"টোকেন তৈরি ব্যর্থ হয়েছে: {str(e)[:60]}"}), 502
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))ailedailed")
+        return None
+
+
+def _parse_major_login_response(content: bytes) -> dict[str, Any]:
+    for offset in range(min(128, len(content))):
+        message = enzoxtsun_pb2.MajorLoginRes()
+        try:
+            message.ParseFromString(content[offset:])
+        except DecodeError:
+            continue
+        if not message.token or not message.account_id:
+            continue
+        return {
+            "account_id": str(message.account_id),
+            "region": message.region,
+            "token": message.token,
+            "location": message.url,
+            "server_time": message.server_time,
+            "aes_ak": message.aes_ak,
+            "iv_i": message.iv_i,
+        }
+    raise InvalidMajorLoginResponse
+
+
+async def send_major_login(open_id: str, access_token: str) -> dict[str, Any]:
+    encrypted_data = aes_encrypt(build_login_request(open_id, access_token))
+    headers = {
+        "User-Agent": USERAGENT,
+        "Connection": "Keep-Alive",
+        "Accept-Encoding": "deflate, gzip",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Expect": "100-continue",
+        "X-GA-SV": os.environ.get("X_GA_SV", "1790603268"),
+        "X-Unity-Version": "2018.4.12f1",
+        "X-GA": "v1 1",
+        "ReleaseVersion": RELEASEVERSION,
+    }
+    timeout = httpx.Timeout(REQUEST_TIMEOUT)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                f"{MAJOR_LOGIN_URL}/MajorLogin",
+                content=encrypted_data,
+                headers=headers,
+            )
+            response.raise_for_status()
+    except httpx.TimeoutException as exc:
+        raise UpstreamTimeoutError from exc
+    except httpx.HTTPStatusError as exc:
+        app.logger.warning(
+            "MajorLogin upstream returned HTTP %s (content_type=%s, bytes=%d)",
+            exc.response.status_code,
+            exc.response.headers.get("content-type", "unknown"),
+            len(exc.response.content),
+        )
         raise UpstreamRequestError from exc
     except httpx.RequestError as exc:
         raise UpstreamRequestError from exc
